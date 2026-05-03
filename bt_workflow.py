@@ -1,7 +1,7 @@
 """
 Full SPY Trading Workflow in Backtrader
 ========================================
-Stage 0 - Generate synthetic SPY OHLCV data (GBM)
+Stage 0 - Fetch real OHLCV data from Yahoo Finance
 Stage 1 - Backtrader in-sample run: SMA(20/50) crossover + analyzers
 Stage 2 - Permutation test: does the signal have real edge? (numpy)
 Stage 3 - Backtrader out-of-sample validation
@@ -14,82 +14,48 @@ What Backtrader adds over hand-rolled code:
   - Trade log with entry/exit prices and P&L
 """
 
+
 import numpy as np
 import pandas as pd
 import matplotlib
-matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 import backtrader as bt
 import backtrader.analyzers as btanalyzers
-from datetime import datetime, timedelta
-import warnings
-warnings.filterwarnings("ignore")
 
-np.random.seed(42)
+import warnings
+from config.config_loader import TICKER, N_IN, N_OUT, CASH, COMMISSION
+from data_management.fetcher.yahoo_finance import YahooFinanceFetcher
+
+warnings.filterwarnings("ignore")  # suppress yfinance/pandas noise
+matplotlib.use("Agg")
 
 # ── CONFIG ─────────────────────────────────────────────────────────
-S0          = 400.0
-ANN_MU      = 0.10
-ANN_SIGMA   = 0.18
-N_IN        = 1260       # ~5 years in-sample
-N_OUT       = 504        # ~2 years out-of-sample
+
 FAST        = 20
 SLOW        = 50
-COMMISSION  = 0.001      # 0.1% per trade (realistic for ETFs)
-CASH        = 100_000.0  # starting capital
+
 N_PERMS     = 1000       # permutation test iterations
 RF_DAILY    = 0.02 / 252
 
-daily_mu    = ANN_MU / 252
-daily_sigma = ANN_SIGMA / np.sqrt(252)
-
 # ══════════════════════════════════════════════════════════════════
-# STAGE 0 - GENERATE SYNTHETIC OHLCV DATA
+# STAGE 0 - FETCH OHLCV DATA FROM YAHOO FINANCE
 # ══════════════════════════════════════════════════════════════════
 print("=" * 60)
-print("STAGE 0 - Generating synthetic SPY OHLCV data")
+print(f"STAGE 0 - Fetching {TICKER} OHLCV data from Yahoo Finance")
 print("=" * 60)
 
-def make_ohlcv(n_days, s0, mu, sigma, seed=None):
-    """Generate realistic OHLCV bars from GBM close prices."""
-    rng  = np.random.default_rng(seed)
-    lr   = (mu - 0.5*sigma**2) + sigma * rng.standard_normal(n_days)
-    close = s0 * np.exp(np.cumsum(lr))
 
-    # Intraday range: O/H/L derived from close with small noise
-    intra = sigma * 0.6  # intraday vol ~60% of daily vol
-    noise = rng.standard_normal((n_days, 2)) * intra
-    open_ = np.concatenate([[s0], close[:-1]]) * np.exp(noise[:, 0] * 0.3)
-    high  = np.maximum(open_, close) * np.exp(np.abs(noise[:, 1]) * 0.5)
-    low   = np.minimum(open_, close) * np.exp(-np.abs(noise[:, 0]) * 0.5)
-    vol   = (rng.integers(500_000, 5_000_000, n_days)).astype(float)
 
-    # Build a proper DatetimeIndex (skip weekends)
-    dates = []
-    d = datetime(2018, 1, 2)
-    while len(dates) < n_days:
-        if d.weekday() < 5:
-            dates.append(d)
-        d += timedelta(days=1)
+fetcher = YahooFinanceFetcher(TICKER)
+df_in, lr_in, px_in, df_out, lr_out, px_out = fetcher.fetch()
 
-    df = pd.DataFrame({
-        "open":   open_,
-        "high":   high,
-        "low":    low,
-        "close":  close,
-        "volume": vol,
-        "openinterest": 0.0,
-    }, index=pd.DatetimeIndex(dates))
-    return df, lr, close
+S0 = px_in[0]  # used by sma_signal_returns to reconstruct price scale
 
-df_in,  lr_in,  px_in  = make_ohlcv(N_IN,  S0,         daily_mu, daily_sigma, seed=42)
-df_out, lr_out, px_out = make_ohlcv(N_OUT, px_in[-1],  daily_mu, daily_sigma, seed=99)
-
-print(f"In-sample  : {N_IN} bars | {df_in.index[0].date()} to {df_in.index[-1].date()}")
-print(f"             start=${S0:.0f}  end=${px_in[-1]:.0f}")
+print(f"In-sample    : {N_IN} bars | {df_in.index[0].date()} to {df_in.index[-1].date()}")
+print(f"               start=${px_in[0]:.2f}  end=${px_in[-1]:.2f}")
 print(f"Out-of-sample: {N_OUT} bars | {df_out.index[0].date()} to {df_out.index[-1].date()}")
-print(f"               start=${px_in[-1]:.0f}  end=${px_out[-1]:.0f}")
+print(f"               start=${px_out[0]:.2f}  end=${px_out[-1]:.2f}")
 
 # ══════════════════════════════════════════════════════════════════
 # BACKTRADER STRATEGY DEFINITION

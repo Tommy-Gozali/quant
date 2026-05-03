@@ -1,0 +1,8 @@
+data:
+  TICKER: SPY
+  N_IN: 1260       # ~5 years in-sample
+  N_OUT: 504        # ~2 years out-of-sample
+
+trade:
+  COMMISSION: 0.001      # 0.1% per trade (realistic for ETFs)
+  CASH      : 100000   # starting capital
