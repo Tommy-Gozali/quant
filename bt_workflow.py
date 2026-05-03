@@ -1,17 +1,11 @@
 """
-Full SPY Trading Workflow in Backtrader
-========================================
+Full SPY Trading Workflow
+==========================
 Stage 0 - Fetch real OHLCV data from Yahoo Finance
-Stage 1 - Backtrader in-sample run: SMA(20/50) crossover + analyzers
-Stage 2 - Permutation test: does the signal have real edge? (numpy)
-Stage 3 - Backtrader out-of-sample validation
+Stage 1 - In-sample run: SMA(20/50) crossover + stats
+Stage 2 - Permutation test: does the signal have real edge?
+Stage 3 - Out-of-sample validation
 Stage 4 - Combined performance chart
-
-What Backtrader adds over hand-rolled code:
-  - Realistic commission model (0.1% per trade)
-  - Proper order management (market orders next bar open)
-  - Built-in analyzers: Sharpe, DrawDown, TradeAnalyzer
-  - Trade log with entry/exit prices and P&L
 """
 
 
@@ -20,13 +14,11 @@ import pandas as pd
 import matplotlib
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
-import backtrader as bt
-import backtrader.analyzers as btanalyzers
 
 import warnings
 from config.config_loader import TICKER, N_IN, N_OUT, CASH, COMMISSION, RF_DAILY, N_PERMS, FAST, SLOW
 from data_management.fetcher.yahoo_finance import YahooFinanceFetcher
-from models.bt import SMACross
+from models.sma_cross import SMACrossSignal
 
 warnings.filterwarnings("ignore")  # suppress yfinance/pandas noise
 matplotlib.use("Agg")
@@ -43,7 +35,7 @@ print("=" * 60)
 fetcher = YahooFinanceFetcher(TICKER)
 df_in, lr_in, px_in, df_out, lr_out, px_out = fetcher.fetch()
 
-S0 = px_in[0]  # used by sma_signal_returns to reconstruct price scale
+strategy = SMACrossSignal()
 
 print(f"In-sample    : {N_IN} bars | {df_in.index[0].date()} to {df_in.index[-1].date()}")
 print(f"               start=${px_in[0]:.2f}  end=${px_in[-1]:.2f}")
@@ -51,35 +43,79 @@ print(f"Out-of-sample: {N_OUT} bars | {df_out.index[0].date()} to {df_out.index[
 print(f"               start=${px_out[0]:.2f}  end=${px_out[-1]:.2f}")
 
 # ══════════════════════════════════════════════════════════════════
-# BACKTRADER STRATEGY DEFINITION
+# SHARED HELPERS
 # ══════════════════════════════════════════════════════════════════
 
+def sharpe(lr):
+    ann_r = lr.mean() * 252
+    ann_v = lr.std()  * np.sqrt(252)
+    return (ann_r - RF_DAILY * 252) / ann_v if ann_v > 0 else 0
 
-def run_backtrader(df, cash=CASH, commission=COMMISSION, printlog=False):
-    """Run Backtrader on a given OHLCV DataFrame. Returns cerebro + strategy."""
-    cerebro = bt.Cerebro()
-    cerebro.broker.setcash(cash)
-    cerebro.broker.setcommission(commission=commission)
+def dd_curve(vals):
+    pk = np.maximum.accumulate(vals)
+    return (vals - pk) / pk * 100
 
-    feed = bt.feeds.PandasData(dataname=df)
-    cerebro.adddata(feed)
-    cerebro.addstrategy(SMACross)
+def _max_dd_duration(port):
+    peak, cur, worst = port[0], 0, 0
+    for v in port:
+        if v >= peak:
+            peak, cur = v, 0
+        else:
+            cur += 1
+            worst = max(worst, cur)
+    return worst
 
-    # Analyzers
-    cerebro.addanalyzer(btanalyzers.SharpeRatio,
-                        _name="sharpe",
-                        riskfreerate=RF_DAILY * 252,
-                        annualize=True,
-                        timeframe=bt.TimeFrame.Days)
-    cerebro.addanalyzer(btanalyzers.DrawDown,    _name="drawdown")
-    cerebro.addanalyzer(btanalyzers.TradeAnalyzer, _name="trades")
-    cerebro.addanalyzer(btanalyzers.Returns,     _name="returns")
-    cerebro.addanalyzer(btanalyzers.AnnualReturn, _name="annual")
 
-    results = cerebro.run()
-    strat   = results[0]
+def run_strategy(df, cash=CASH, commission=COMMISSION, printlog=False):
+    """
+    Simulate the SMA crossover strategy on a given OHLCV DataFrame.
 
-    final_val = cerebro.broker.getvalue()
+    Uses integer share sizing and applies commission on both entry and exit,
+    matching realistic brokerage behaviour.
+
+    Returns
+    -------
+    port : np.ndarray
+        Portfolio value at the close of every bar (length == len(df)).
+    final_val : float
+        Portfolio value on the last bar.
+    total_ret : float
+        Total return as a percentage.
+    trades : list[dict]
+        One entry per order execution with keys:
+        bar, direction, price, size, value, comm.
+    """
+    prices = df["close"].values
+    pos    = strategy.signal(pd.Series(prices))
+
+    port   = [cash]
+    cash_  = cash
+    units  = 0
+    in_pos = False
+    trades = []
+
+    for i in range(1, len(prices)):
+        p = prices[i]
+        if pos.iloc[i] == 1 and not in_pos:
+            units = int(cash_ / p)
+            if units > 0:
+                cost   = units * p * commission
+                cash_ -= units * p + cost
+                in_pos = True
+                trades.append({"bar": i, "direction": "BUY ", "price": p,
+                                "size": units, "value": units * p, "comm": cost})
+        elif pos.iloc[i] == 0 and in_pos:
+            proceeds = units * p
+            cost     = proceeds * commission
+            cash_   += proceeds - cost
+            trades.append({"bar": i, "direction": "SELL", "price": p,
+                            "size": units, "value": proceeds, "comm": cost})
+            units  = 0
+            in_pos = False
+        port.append(cash_ + units * p)
+
+    port      = np.array(port)
+    final_val = port[-1]
     total_ret = (final_val - cash) / cash * 100
 
     if printlog:
@@ -87,37 +123,35 @@ def run_backtrader(df, cash=CASH, commission=COMMISSION, printlog=False):
         print(f"  Final value      : ${final_val:,.0f}")
         print(f"  Total return     : {total_ret:.2f}%")
 
-        sh = strat.analyzers.sharpe.get_analysis().get("sharperatio", None)
-        print(f"  Sharpe ratio     : {sh:.3f}" if sh else "  Sharpe ratio     : N/A")
+        port_lr = np.log(port[1:] / np.maximum(port[:-1], 1e-10))
+        print(f"  Sharpe ratio     : {sharpe(port_lr):.3f}")
+        print(f"  Max drawdown     : {dd_curve(port).min():.2f}%")
+        print(f"  Max DD duration  : {_max_dd_duration(port)} bars")
 
-        dd = strat.analyzers.drawdown.get_analysis()
-        print(f"  Max drawdown     : {dd.max.drawdown:.2f}%")
-        print(f"  Max DD duration  : {dd.max.len} bars")
+        buys   = [t for t in trades if t["direction"] == "BUY "]
+        sells  = [t for t in trades if t["direction"] == "SELL"]
+        pairs  = list(zip(buys, sells))
+        pnls   = [s["value"] - s["comm"] - b["value"] - b["comm"] for b, s in pairs]
+        wins   = [p for p in pnls if p > 0]
+        losses = [p for p in pnls if p <= 0]
+        n      = len(pairs)
+        wr     = len(wins) / n * 100 if n else 0
+        print(f"  Total trades     : {n}")
+        print(f"  Win rate         : {wr:.1f}%  ({len(wins)}W / {len(losses)}L)")
+        if wins and losses:
+            print(f"  Avg win / loss   : ${np.mean(wins):,.0f} / ${np.mean(losses):,.0f}")
 
-        ta = strat.analyzers.trades.get_analysis()
-        total_trades = ta.get("total", {}).get("total", 0)
-        won  = ta.get("won",  {}).get("total", 0)
-        lost = ta.get("lost", {}).get("total", 0)
-        win_rate = (won / total_trades * 100) if total_trades > 0 else 0
-        print(f"  Total trades     : {total_trades}")
-        print(f"  Win rate         : {win_rate:.1f}%  ({won}W / {lost}L)")
-
-        avg_win  = ta.get("won",  {}).get("pnl", {}).get("average", 0)
-        avg_loss = ta.get("lost", {}).get("pnl", {}).get("average", 0)
-        if avg_win and avg_loss:
-            print(f"  Avg win / loss   : ${avg_win:,.0f} / ${avg_loss:,.0f}")
-
-    return cerebro, strat, final_val, total_ret
+    return port, final_val, total_ret, trades
 
 
 # ══════════════════════════════════════════════════════════════════
-# STAGE 1 - IN-SAMPLE BACKTRADER RUN
+# STAGE 1 - IN-SAMPLE RUN
 # ══════════════════════════════════════════════════════════════════
 print("\n" + "=" * 60)
-print("STAGE 1 - Backtrader in-sample run")
+print("STAGE 1 - In-sample run")
 print("=" * 60)
 
-cerebro_in, strat_in, final_in, ret_in = run_backtrader(df_in, printlog=True)
+port_in, final_in, ret_in, trades_in = run_strategy(df_in, printlog=True)
 
 # Buy-and-hold benchmark (in-sample)
 bh_in_ret = (px_in[-1] / px_in[0] - 1) * 100
@@ -125,32 +159,18 @@ print(f"\n  Buy-and-hold     : {bh_in_ret:.2f}%  (no commission)")
 print(f"  Strategy edge    : {ret_in - bh_in_ret:+.2f}%")
 
 # ══════════════════════════════════════════════════════════════════
-# STAGE 2 - PERMUTATION TEST (numpy, applied to Backtrader signal)
+# STAGE 2 - PERMUTATION TEST
 # ══════════════════════════════════════════════════════════════════
 print("\n" + "=" * 60)
 print(f"STAGE 2 - Permutation test ({N_PERMS:,} shuffles)")
 print("=" * 60)
 
-def sma_signal_returns(log_returns):
-    """Compute strategy daily log-returns for a given return series."""
-    prices   = S0 * np.exp(np.cumsum(log_returns))
-    px_s     = pd.Series(prices)
-    fast_sma = px_s.rolling(FAST).mean()
-    slow_sma = px_s.rolling(SLOW).mean()
-    position = (fast_sma > slow_sma).astype(float).shift(1).fillna(0)
-    return log_returns * position.values
-
-def sharpe(lr):
-    ann_r = lr.mean() * 252
-    ann_v = lr.std()  * np.sqrt(252)
-    return (ann_r - RF_DAILY*252) / ann_v if ann_v > 0 else 0
-
-actual_lr     = sma_signal_returns(lr_in)
+actual_lr     = strategy.apply(lr_in)
 actual_sharpe = sharpe(actual_lr)
 
 rng = np.random.default_rng(0)
 perm_sharpes = np.array([
-    sharpe(sma_signal_returns(rng.permutation(lr_in)))
+    sharpe(strategy.apply(rng.permutation(lr_in)))
     for _ in range(N_PERMS)
 ])
 
@@ -167,23 +187,23 @@ verdict = "EDGE DETECTED" if p_value < 0.05 else "NO SIGNIFICANT EDGE"
 print(f"\n  RESULT: {verdict}  (p={p_value:.3f})")
 
 # ══════════════════════════════════════════════════════════════════
-# STAGE 3 - OUT-OF-SAMPLE BACKTRADER RUN
+# STAGE 3 - OUT-OF-SAMPLE VALIDATION
 # ══════════════════════════════════════════════════════════════════
 print("\n" + "=" * 60)
-print("STAGE 3 - Backtrader out-of-sample validation")
+print("STAGE 3 - Out-of-sample validation")
 print("=" * 60)
 
-cerebro_out, strat_out, final_out, ret_out = run_backtrader(df_out, printlog=True)
+port_out, final_out, ret_out, trades_out = run_strategy(df_out, printlog=True)
 
 bh_out_ret = (px_out[-1] / px_out[0] - 1) * 100
 print(f"\n  Buy-and-hold     : {bh_out_ret:.2f}%  (no commission)")
 print(f"  Strategy edge    : {ret_out - bh_out_ret:+.2f}%")
 
 # Trade log
-print("\n  Trade log (Backtrader):")
+print("\n  Trade log:")
 print(f"  {'#':<4} {'Dir':<5} {'Bar':<6} {'Price':>8} {'Size':>7} {'Comm':>8}")
 print("  " + "-"*45)
-for i, t in enumerate(strat_out.trades, 1):
+for i, t in enumerate(trades_out, 1):
     print(f"  {i:<4} {t['direction']:<5} {t['bar']:<6} "
           f"${t['price']:>7.2f} {int(t['size']):>7} ${t['comm']:>7.2f}")
 
@@ -194,51 +214,12 @@ print("\n" + "=" * 60)
 print("STAGE 4 - Generating charts")
 print("=" * 60)
 
-# Reconstruct portfolio value curves from signal
-def portfolio_curve(log_returns, prices, cash=CASH, commission=COMMISSION):
-    """Simulate portfolio value with commission on trades."""
-    px   = pd.Series(prices)
-    fma  = px.rolling(FAST).mean()
-    sma  = px.rolling(SLOW).mean()
-    pos  = (fma > sma).astype(float).shift(1).fillna(0)
-
-    port  = [cash]
-    units = 0.0
-    cash_ = cash
-    in_pos = False
-
-    for i in range(1, len(log_returns)):
-        if pos.iloc[i] == 1 and not in_pos:
-            units  = cash_ / prices[i]
-            cost   = cash_ * commission
-            cash_  = 0.0
-            cash_ -= cost
-            in_pos = True
-        elif pos.iloc[i] == 0 and in_pos:
-            cash_  = units * prices[i]
-            cost   = cash_ * commission
-            cash_ -= cost
-            units  = 0.0
-            in_pos = False
-
-        val = cash_ + units * prices[i]
-        port.append(val)
-
-    return np.array(port)
-
-port_in  = portfolio_curve(lr_in,  px_in)
-port_out = portfolio_curve(lr_out, px_out)
 bh_in_curve  = CASH * px_in  / px_in[0]
 bh_out_curve = CASH * px_out / px_out[0]
 
-# Drawdown helper
-def dd_curve(vals):
-    pk = np.maximum.accumulate(vals)
-    return (vals - pk) / pk * 100
-
 fig = plt.figure(figsize=(16, 18))
 fig.suptitle(
-    "SPY SMA(20/50) Workflow - Backtrader Implementation\n"
+    f"SPY SMA({FAST}/{SLOW}) Workflow\n"
     "Stage 1: In-sample  |  Stage 2: Permutation Test  |  Stage 3: Out-of-sample",
     fontsize=13, fontweight="bold", y=0.99
 )
@@ -251,7 +232,7 @@ days_out = np.arange(N_OUT)
 ax1 = fig.add_subplot(gs[0, :])
 fma_in = pd.Series(px_in).rolling(FAST).mean()
 sma_in = pd.Series(px_in).rolling(SLOW).mean()
-sig_in = (fma_in > sma_in).astype(float).shift(1).fillna(0)
+sig_in = strategy.signal(pd.Series(px_in))
 
 ax1.plot(days_in, px_in, color="black", linewidth=0.9, alpha=0.7, label="SPY")
 ax1.plot(days_in, fma_in.values, color="royalblue",  linewidth=1.3, label=f"SMA({FAST})")
@@ -302,7 +283,7 @@ ax3.grid(alpha=0.2)
 ax4 = fig.add_subplot(gs[2, :])
 fma_out = pd.Series(px_out).rolling(FAST).mean()
 sma_out = pd.Series(px_out).rolling(SLOW).mean()
-sig_out = (fma_out > sma_out).astype(float).shift(1).fillna(0)
+sig_out = strategy.signal(pd.Series(px_out))
 
 ax4.plot(days_out, px_out, color="black", linewidth=0.9, alpha=0.7, label="SPY")
 ax4.plot(days_out, fma_out.values, color="royalblue",  linewidth=1.2, label=f"SMA({FAST})")
