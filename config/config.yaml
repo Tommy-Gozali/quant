@@ -6,3 +6,4 @@ data:
 trade:
   COMMISSION: 0.001      # 0.1% per trade (realistic for ETFs)
   CASH      : 100000   # starting capital
+
